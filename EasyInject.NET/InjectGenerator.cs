@@ -25,109 +25,104 @@ namespace EasyInject.NET
         {
             var injectDeclarations = context.SyntaxProvider
                 .CreateSyntaxProvider(
-                    predicate: static (s, _) => IsInjectDeclaration(s),
+                    predicate: static (s, _) => IsPossibleInjection(s),
                     transform: static (g, _) => GetInjectDeclarations(g))
                 .Where(v => v.Item1 != null);
 
-            context.RegisterImplementationSourceOutput(injectDeclarations, (c, s) =>
-            {
-                var (classSyntax, fields, properties) = s;
-
-                var @namespace = classSyntax.GetNamespaceDisplay();
-                var modifier = classSyntax.Modifiers.FirstOrDefault().ToString();
-                var keyword = classSyntax.Keyword.ToString();
-                var name = classSyntax.Identifier.Value;
-
-                var members = fields.Cast<IComplexMember>()
-                    .Concat(properties.Cast<IComplexMember>());
-
-                var constructorArguments = members
-                    .Select(m => m.AsConstructorArgument())
-                    .Aggregate((a, b) => a + "," + b);
-
-                var constructorSetter = members
-                    .Select(m => m.AsConstructorSetter())
-                    .Aggregate((a, b) => a + "\n" + b);
-
-                var source = $$"""
-                    namespace {{@namespace}} {
-                        {{modifier}} partial {{keyword}} {{name}} {
-                            {{modifier}} {{name}} ({{constructorArguments}}) {
-                                {{constructorSetter}}
-                            }
-                        }
-                    }
-                """;
-
-                c.AddSource($"{name}.g.cs", FormatCode(source));
-            });
+            context.RegisterImplementationSourceOutput(injectDeclarations, CodeGenerator.Generate);
         }
 
-        static bool IsInjectDeclaration(SyntaxNode node)
-        {
-            if (node is not ClassDeclarationSyntax classSyntax)
-                return false;
-            
-            var hasFieldsWithAttributes = node.ChildNodes()
-                .OfType<FieldDeclarationSyntax>()
-                .Any(f => f.AttributeLists.Count > 0);
+        static bool IsPossibleInjection(SyntaxNode node)
+            => node is ClassDeclarationSyntax classSyntax && classSyntax.GetPropertiesAndFieldsAsMember().Any(m => m.AnyAttribute());
 
-            var hasPropertiesWithAttributes = node.ChildNodes()
-                .OfType<PropertyDeclarationSyntax>()
-                .Any(p => p.AttributeLists.Count > 0);
-
-            return hasFieldsWithAttributes || hasPropertiesWithAttributes;
-        }
-
-
-        static (ClassDeclarationSyntax, List<ComplexField>, List<ComplexProperty>) GetInjectDeclarations(GeneratorSyntaxContext context)
+        static (ClassDeclarationSyntax, 
+            ConstructorDeclarationSyntax?,
+            List<IComplexMember>) GetInjectDeclarations(GeneratorSyntaxContext context)
         {
             var classSyntax = (ClassDeclarationSyntax) context.Node;
-            var fields = classSyntax.ChildNodes()
-                .OfType<FieldDeclarationSyntax>()
-                .Where(f => HasInjectFied(f, context.SemanticModel))
-                .Select(f => f.GetComplex(context.SemanticModel))
+            var members = classSyntax.GetPropertiesAndFieldsAsMember()
+                .Where(m => m.AnyAttribute(attribute => IsInjectAttribute(attribute, context.SemanticModel)))
+                .Select(m => ComplexMembers.Of(m, context.SemanticModel))
                 .ToList();
 
-            var properties = classSyntax.ChildNodes()
-                .OfType<PropertyDeclarationSyntax>()
-                .Where(p => HasInjectProperty(p, context.SemanticModel))
-                .Select(p => p.GetComplex(context.SemanticModel))
-                .ToList();
+            if (!members.Any())
+                return (null, null, null);
 
-            return fields.Any() || properties.Any() ? (classSyntax, fields, properties) : (null, null, null); 
+            var membersNames = members.Select(m => m.GetDisplayName());
+            var constructor = classSyntax.ChildNodes()
+                .OfType<ConstructorDeclarationSyntax>()
+                .Where(c => c.AnyAttribute(attribute => IsPartialConstructorAttribute(attribute, context.SemanticModel)))
+                .Where(c => c.ParameterList.Parameters.All(p => membersNames.Contains(p.Identifier.ValueText)))
+                .FirstOrDefault();
+
+            return (classSyntax, constructor, members);
         }
-
-        static bool HasInjectFied(FieldDeclarationSyntax syntax, SemanticModel model)
-            => syntax.AttributeLists.Any(s => s.Attributes.Any(a => IsInjectAttribute(a, model)));
-
-        static bool HasInjectProperty(PropertyDeclarationSyntax syntax, SemanticModel model)
-            => syntax.AttributeLists.Any(s => s.Attributes.Any(a => IsInjectAttribute(a, model)));
 
         static bool IsInjectAttribute(AttributeSyntax attribute, SemanticModel model)
-        {
-            var symbol = (IMethodSymbol)model.GetSymbolInfo(attribute).Symbol;
-            if (symbol == null)
-                return false;
+            => model.EqualsAttribute(attribute, InjectAttributeFullName);
 
-            var namedSymbol = symbol.ContainingType;
-            return namedSymbol.ToDisplayString() == InjectAttributeFullName;
-        }
-
-        static string FormatCode(string str)
-            => CSharpSyntaxTree.ParseText(str)
-                .GetRoot()
-                .NormalizeWhitespace()
-                .SyntaxTree
-                .ToString();
+        static bool IsPartialConstructorAttribute(AttributeSyntax attribute, SemanticModel model)
+            => model.EqualsAttribute(attribute, PartialConstructorAttributeFullName);
 
         const string InjectAttributeFullName = "EasyInject.NET.Attributes.InjectAttribute";
+        const string PartialConstructorAttributeFullName = "EasyInject.NET.Attributes.PartialConstructorAttribute";
+    }
+
+    internal static class CodeGenerator
+    {
+        internal static void Generate(SourceProductionContext context,
+            (ClassDeclarationSyntax classSyntax, 
+            ConstructorDeclarationSyntax? partialConstructorSyntax, 
+            List<IComplexMember> members) entry)
+            => Generate(context, entry.classSyntax, entry.partialConstructorSyntax, entry.members);
+
+        internal static void Generate(SourceProductionContext context, 
+            ClassDeclarationSyntax classSyntax,
+            ConstructorDeclarationSyntax? partialConstructorSyntax,
+            List<IComplexMember> members)
+        {
+            var className = classSyntax.Identifier.ValueText;
+            var source = GenerateSource(classSyntax, partialConstructorSyntax, members);
+            context.AddSource($"{className}.g.cs", CodeFormatter.Format(source));
+        }
+
+        private static string GenerateSource(ClassDeclarationSyntax classSyntax,
+            ConstructorDeclarationSyntax? partialConstructorSyntax,
+            List<IComplexMember> members)
+        {
+            var classNamespace = classSyntax.GetNamespaceDisplay();
+            var classModifier = classSyntax.Modifiers.FirstOrDefault().ToString();
+            var classKeyword = classSyntax.Keyword.ToString();
+            var className = classSyntax.Identifier.Value;
+
+            var constructorArguments = members
+                .Select(m => m.AsConstructorArgument())
+                .Aggregate((a, b) => a + "," + b);
+
+            var constructorSetter = members
+                .Select(m => m.AsConstructorSetter())
+                .Aggregate((a, b) => a + "\n" + b);
+
+            var partialConstructorBody = partialConstructorSyntax.GetBodyContent();
+
+            return $$"""
+                namespace {{classNamespace}} {
+                    {{classModifier}} partial {{classKeyword}} {{className}} {
+                        {{classModifier}} {{className}} ({{constructorArguments}}) {
+                            {{constructorSetter}}
+                            {{partialConstructorBody}}
+                        }
+                    }
+                }
+            """;
+        }
     }
 
     interface IComplexMember
     {
         string AsConstructorArgument();
         string AsConstructorSetter();
+        string GetDisplayName();
     }
 
     internal record ComplexField : IComplexMember
@@ -138,7 +133,7 @@ namespace EasyInject.NET
         private string GetDisplayType()
             => Symbol.Type.ToDisplayString();
 
-        private string GetDisplayName()
+        public string GetDisplayName()
             => Syntax.Declaration.Variables.FirstOrDefault().Identifier.ValueText;
 
         public string AsConstructorArgument()
@@ -146,34 +141,13 @@ namespace EasyInject.NET
 
         public string AsConstructorSetter()
             => $"this.{GetDisplayName()} = {GetDisplayName()};";
-    }
 
-    internal record ComplexProperty : IComplexMember
-    {
-        public PropertyDeclarationSyntax Syntax { get; init; }
-        public IPropertySymbol Symbol { get; init; }
-
-        private string GetDisplayType()
-            => Symbol.Type.ToDisplayString();
-
-        private string GetDisplayName()
-            => Syntax.Identifier.ValueText;
-
-        public string AsConstructorArgument()
-            => $"{GetDisplayType()} {GetDisplayName()}";
-
-        public string AsConstructorSetter()
-            => $"this.{GetDisplayName()} = {GetDisplayName()};";
-    }
-
-    internal static class ComplexExtensions
-    {
-        internal static ComplexField? GetComplex(this FieldDeclarationSyntax syntax, SemanticModel model)
+        public static ComplexField Of(FieldDeclarationSyntax syntax, SemanticModel model)
         {
             var symbol = syntax.Declaration.Variables
-                .Select(v => model.GetDeclaredSymbol(v))
-                .OfType<IFieldSymbol>()
-                .FirstOrDefault();
+               .Select(v => model.GetDeclaredSymbol(v))
+               .OfType<IFieldSymbol>()
+               .FirstOrDefault();
 
             if (symbol == null)
                 return null;
@@ -184,8 +158,26 @@ namespace EasyInject.NET
                 Symbol = symbol
             };
         }
+    }
 
-        internal static ComplexProperty? GetComplex(this PropertyDeclarationSyntax syntax, SemanticModel model)
+    internal record ComplexProperty : IComplexMember
+    {
+        public PropertyDeclarationSyntax Syntax { get; init; }
+        public IPropertySymbol Symbol { get; init; }
+
+        private string GetDisplayType()
+            => Symbol.Type.ToDisplayString();
+
+        public string GetDisplayName()
+            => Syntax.Identifier.ValueText;
+
+        public string AsConstructorArgument()
+            => $"{GetDisplayType()} {GetDisplayName()}";
+
+        public string AsConstructorSetter()
+            => $"this.{GetDisplayName()} = {GetDisplayName()};";
+
+        public static ComplexProperty Of(PropertyDeclarationSyntax syntax, SemanticModel model)
         {
             var symbol = model.GetDeclaredSymbol(syntax);
             if (symbol == null || symbol is not IPropertySymbol propertySymbol)
@@ -199,7 +191,30 @@ namespace EasyInject.NET
         }
     }
 
-    internal static class ClassExtensions
+    internal static class ComplexMembers
+    {
+        internal static IComplexMember? Of(MemberDeclarationSyntax syntax, SemanticModel model)
+            => syntax switch
+            {
+                PropertyDeclarationSyntax propertySyntax => ComplexProperty.Of(propertySyntax, model),
+                FieldDeclarationSyntax fieldSyntax => ComplexField.Of(fieldSyntax, model),
+                _ => null
+            };
+    }
+
+    internal static class BaseMethodDeclarationSyntanxExtensions
+    {
+        internal static string GetBodyContent(this ConstructorDeclarationSyntax methodSyntax)
+        {
+            if (methodSyntax.ExpressionBody != null)
+                return methodSyntax.ExpressionBody.Expression.ToFullString() + ";";
+
+            return methodSyntax.Body
+                .Statements.ToFullString();
+        }
+    }
+
+    internal static class ClassDeclarationSyntaxEntesions
     {
         internal static string GetNamespaceDisplay(this ClassDeclarationSyntax syntax)
         {
@@ -213,6 +228,45 @@ namespace EasyInject.NET
             }
 
             return ((NamespaceDeclarationSyntax?)parent)?.Name?.ToFullString();
+        }
+
+        internal static IEnumerable<MemberDeclarationSyntax> GetPropertiesAndFieldsAsMember(this ClassDeclarationSyntax classSyntax)
+            => classSyntax.ChildNodes()
+                .OfType<PropertyDeclarationSyntax>()
+                .Cast<MemberDeclarationSyntax>()
+                .Concat(classSyntax.ChildNodes()
+                    .OfType<FieldDeclarationSyntax>());
+    }
+
+    internal static class MemberDeclarationSyntaxEntesions
+    {
+        internal static bool AnyAttribute(this MemberDeclarationSyntax classSyntax)
+            => classSyntax.AttributeLists.Any(l => l.Attributes.Any());
+
+        internal static bool AnyAttribute(this MemberDeclarationSyntax classSyntax, Func<AttributeSyntax, bool> predicate)
+            => classSyntax.AttributeLists.Any(l => l.Attributes.Any(predicate));
+    }
+
+    internal static class CodeFormatter
+    {
+        internal static string Format(string code)
+            => CSharpSyntaxTree.ParseText(code)
+                .GetRoot()
+                .NormalizeWhitespace()
+                .SyntaxTree
+                .ToString();
+    }
+
+    internal static class SemanticModelExtensions
+    {
+        internal static bool EqualsAttribute(this SemanticModel model, AttributeSyntax attributeSyntax, string attributeFullName)
+        {
+            var symbol = (IMethodSymbol?)model.GetSymbolInfo(attributeSyntax).Symbol;
+            if (symbol == null)
+                return false;
+
+            var namedSymbol = symbol.ContainingType;
+            return namedSymbol.ToDisplayString() == attributeFullName;
         }
     }
 }
